@@ -1,107 +1,158 @@
-const http = require('http');
+// TrackRace lobby server: duels (2 players, same car) and races (up to 4 players).
 const { WebSocketServer } = require('ws');
-
 const PORT = process.env.PORT || 3000;
-const MAX = { race: 4, duel: 2 };
-const lobbies = new Map(); // id -> { id, type, isPrivate, code, players: Map }
+const wss = new WebSocketServer({ port: PORT });
 
-const server = http.createServer((req, res) => {
-  res.writeHead(200, { 'Content-Type': 'text/plain' });
-  res.end('Highway race server running');
-});
-const wss = new WebSocketServer({ server });
+const MAX_PLAYERS = { duel: 2, race: 4 };
+const COUNTDOWN_MS = 10000;
+const lobbies = new Map(); // id -> lobby
+const codes = new Map();   // private code -> lobby id
+let nextId = 1;
 
-function lobbyStatus(l) {
-  if (l.players.size >= MAX[l.type]) return 'full';
-  if (l.isPrivate) return 'private';
-  if (l.players.size >= 2) return 'about to race';
-  return 'open';
+function makeCode() {
+  const alphabet = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+  let c;
+  do {
+    c = '';
+    for (let i = 0; i < 4; i++) c += alphabet[Math.floor(Math.random() * alphabet.length)];
+  } while (codes.has(c)); // never reuse a code while its lobby is active
+  return c;
 }
 
-function lobbyList() {
-  return [...lobbies.values()]
-    .filter(l => !l.isPrivate)
-    .map(l => ({ id: l.id, type: l.type, count: l.players.size, max: MAX[l.type], status: lobbyStatus(l) }));
+function publicList() {
+  const out = [];
+  for (const l of lobbies.values()) {
+    if (l.private) continue;
+    out.push(summary(l));
+  }
+  return out;
 }
 
-function sendTo(ws, msg) {
-  if (ws.readyState === 1) ws.send(JSON.stringify(msg));
+function summary(l) {
+  return {
+    id: l.id, type: l.type, host: l.players[0]?.name || '', laps: l.laps, car: l.car,
+    count: l.players.length, max: MAX_PLAYERS[l.type], isPrivate: l.private,
+    startsAt: l.startsAt || null, started: !!l.started,
+  };
 }
 
-function broadcastLobbies() {
-  const msg = { type: 'lobbies', lobbies: lobbyList() };
-  wss.clients.forEach(ws => sendTo(ws, msg));
+function send(ws, msg) { if (ws.readyState === 1) ws.send(JSON.stringify(msg)); }
+function broadcast(l, msg) { l.players.forEach(p => send(p.ws, msg)); }
+function lobbyState(l) {
+  return { type: 'lobby', lobby: summary(l), code: l.private ? l.code : null,
+    players: l.players.map(p => ({ id: p.id, name: p.name })) };
 }
 
-function sendToLobby(l, msg, except) {
-  l.players.forEach((p, ws) => { if (ws !== except) sendTo(ws, msg); });
+function startCountdown(l) {
+  if (l.startsAt) return;
+  l.startsAt = Date.now() + COUNTDOWN_MS;
+  broadcast(l, { type: 'countdown', startsAt: l.startsAt });
+  l.timer = setTimeout(() => {
+    l.started = true;
+    broadcast(l, { type: 'start' });
+    setTimeout(() => removeLobby(l.id), 1000); // lobby closes once race has begun
+  }, COUNTDOWN_MS);
+  pushLists();
 }
 
-function leaveLobby(ws) {
-  if (!ws.lobbyId) return;
-  const l = lobbies.get(ws.lobbyId);
-  ws.lobbyId = null;
+function removeLobby(id) {
+  const l = lobbies.get(id);
   if (!l) return;
-  l.players.delete(ws);
-  sendToLobby(l, { type: 'players', count: l.players.size });
-  if (l.players.size === 0) lobbies.delete(l.id);
-  broadcastLobbies();
+  clearTimeout(l.timer);
+  if (l.code) codes.delete(l.code);
+  lobbies.delete(id);
+  pushLists();
+}
+
+function pushLists() {
+  for (const ws of wss.clients) {
+    if (ws.inLobby) continue;
+    send(ws, { type: 'lists', lobbies: publicList() });
+  }
 }
 
 wss.on('connection', ws => {
-  ws.lobbyId = null;
-  sendTo(ws, { type: 'lobbies', lobbies: lobbyList() });
+  ws.id = Math.random().toString(36).slice(2);
+  ws.inLobby = null;
+  send(ws, { type: 'lists', lobbies: publicList() });
 
   ws.on('message', raw => {
-    let m;
-    try { m = JSON.parse(raw); } catch { return; }
+    let m; try { m = JSON.parse(raw); } catch { return; }
+
+    if (m.type === 'list') {
+      send(ws, { type: 'lists', lobbies: publicList() });
+    }
 
     if (m.type === 'create') {
-      leaveLobby(ws);
-      const id = Math.random().toString(36).slice(2, 8);
-      const type = MAX[m.lobbyType] ? m.lobbyType : 'race';
-      const isPrivate = !!m.isPrivate;
-      const code = isPrivate ? String(Math.floor(1000 + Math.random() * 9000)) : null;
-      const l = { id, type, isPrivate, code, players: new Map() };
+      if (ws.inLobby) return;
+      const type = m.kind === 'duel' ? 'duel' : 'race';
+      const laps = Math.min(10, Math.max(1, parseInt(m.laps) || 1));
+      const isPrivate = !!m.private;
+      const id = String(nextId++);
+      const l = { id, type, laps, car: m.car || 0, private: isPrivate, code: null,
+        players: [], startsAt: null, started: false, timer: null };
+      if (isPrivate) { l.code = makeCode(); codes.set(l.code, id); }
       lobbies.set(id, l);
-      l.players.set(ws, { name: m.name || 'Player', x: 0, z: 0, h: 0, speed: 0 });
-      ws.lobbyId = id;
-      sendTo(ws, { type: 'joined', id, code, lobbyType: type });
-      broadcastLobbies();
+      join(ws, l, m.name);
     }
 
-    else if (m.type === 'join') {
-      const l = lobbies.get(m.id);
-      if (!l) return sendTo(ws, { type: 'error', message: 'Lobby not found' });
-      if (l.isPrivate && l.code !== String(m.code)) return sendTo(ws, { type: 'error', message: 'Wrong code' });
-      if (l.players.size >= MAX[l.type]) return sendTo(ws, { type: 'error', message: 'Lobby is full' });
-      leaveLobby(ws);
-      l.players.set(ws, { name: m.name || 'Player', x: 0, z: 0, h: 0, speed: 0 });
-      ws.lobbyId = l.id;
-      sendTo(ws, { type: 'joined', id: l.id, code: l.code, lobbyType: l.type });
-      sendToLobby(l, { type: 'players', count: l.players.size }, ws);
-      broadcastLobbies();
+    if (m.type === 'join') {
+      if (ws.inLobby) return;
+      let l = null;
+      if (m.code) {
+        const id = codes.get(String(m.code).toUpperCase());
+        l = id && lobbies.get(id);
+      } else {
+        l = lobbies.get(String(m.id));
+        if (l && l.private) l = null; // private lobbies need the code
+      }
+      if (!l) return send(ws, { type: 'error', message: 'Lobby not found' });
+      if (l.started || l.players.length >= MAX_PLAYERS[l.type]) {
+        return send(ws, { type: 'error', message: 'Lobby is full or already racing' });
+      }
+      join(ws, l, m.name);
     }
 
-    else if (m.type === 'leave') {
-      leaveLobby(ws);
-      sendTo(ws, { type: 'left' });
+    if (m.type === 'leave') leave(ws);
+
+    // Host starts the 10 second countdown for a race (duels start automatically when full).
+    if (m.type === 'start' && ws.inLobby) {
+      const l = lobbies.get(ws.inLobby);
+      if (l && l.type === 'race' && l.players[0]?.ws === ws && l.players.length >= 1) startCountdown(l);
     }
 
-    else if (m.type === 'state') {
-      const l = lobbies.get(ws.lobbyId);
-      if (!l) return;
-      const p = l.players.get(ws);
-      Object.assign(p, { x: m.x, z: m.z, h: m.h, speed: m.speed, braking: !!m.braking });
-      sendToLobby(l, { type: 'car', from: l.players.get(ws).name, x: m.x, z: m.z, h: m.h, speed: m.speed, braking: !!m.braking }, ws);
-    }
-
-    else if (m.type === 'list') {
-      sendTo(ws, { type: 'lobbies', lobbies: lobbyList() });
+    if (m.type === 'state' && ws.inLobby) {
+      const l = lobbies.get(ws.inLobby);
+      if (!l || !l.started) return;
+      const p = l.players.find(x => x.ws === ws);
+      if (!p) return;
+      p.state = m.s;
+      l.players.forEach(o => { if (o !== p) send(o.ws, { type: 'peer', id: p.id, s: m.s }); });
     }
   });
 
-  ws.on('close', () => { leaveLobby(ws); });
+  ws.on('close', () => leave(ws));
 });
 
-server.listen(PORT, () => console.log('Listening on ' + PORT));
+function join(ws, l, name) {
+  const p = { ws, id: ws.id, name: String(name || 'Player').slice(0, 16) };
+  l.players.push(p);
+  ws.inLobby = l.id;
+  broadcast(l, lobbyState(l));
+  if (l.players.length === MAX_PLAYERS[l.type] && l.type === 'duel') startCountdown(l);
+  pushLists();
+}
+
+function leave(ws) {
+  if (!ws.inLobby) return;
+  const l = lobbies.get(ws.inLobby);
+  ws.inLobby = null;
+  if (!l) return;
+  l.players = l.players.filter(p => p.ws !== ws);
+  if (l.players.length === 0 || (!l.started && l.players.length === 0)) return removeLobby(l.id);
+  broadcast(l, lobbyState(l));
+  pushLists();
+}
+
+wss.on('listening', () => console.log('TrackRace server on ' + PORT));
+    
