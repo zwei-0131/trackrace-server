@@ -24,7 +24,7 @@ function summary(l) {
   return {
     id: l.id, type: l.type, host: l.players[0]?.name || '', laps: l.laps, car: l.car,
     count: l.players.length, max: MAX_PLAYERS[l.type], isPrivate: l.private,
-    startsAt: l.startsAt || null, started: !!l.started,
+    startsAt: l.startsAt || null, started: !!l.started, night: !!l.night,
   };
 }
 function publicList() {
@@ -68,6 +68,7 @@ function endRace(l) {
   });
   rows.forEach((r, i) => { r.pos = r.time === null ? null : i + 1; });
   broadcast(l, { type: 'results', rows });
+  l.players.forEach((p) => { p.ws.inLobby = null; });
   removeLobby(l.id);
 }
 
@@ -76,6 +77,7 @@ function removeLobby(id) {
   if (!l) return;
   clearTimeout(l.timer);
   clearTimeout(l.dnfTimer);
+  l.players.forEach((p) => { if (p.ws.inLobby === id) p.ws.inLobby = null; });
   if (l.code) codes.delete(l.code);
   lobbies.delete(id);
   pushLists();
@@ -120,7 +122,7 @@ wss.on('connection', (ws) => {
       const isPrivate = !!m.private;
       const id = String(nextId++);
       const l = { id, type, laps, car: Number.isInteger(m.car) ? m.car : 0, private: isPrivate, code: null,
-        players: [], startsAt: null, started: false, ended: false, timer: null, dnfTimer: null, results: new Map() };
+        night: !!m.night, players: [], startsAt: null, started: false, ended: false, timer: null, dnfTimer: null, results: new Map() };
       if (isPrivate) { l.code = makeCode(); codes.set(l.code, id); }
       lobbies.set(id, l);
       join(ws, l, m.name);
@@ -173,4 +175,3 @@ wss.on('connection', (ws) => {
 });
 
 wss.on('listening', () => console.log('TrackRace server on ' + PORT));
-        
