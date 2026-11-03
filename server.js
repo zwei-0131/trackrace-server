@@ -154,7 +154,7 @@ wss.on('connection', (ws) => {
 
     if (m.type === 'state' && ws.inLobby) {
       const l = lobbies.get(ws.inLobby);
-      if (!l || !l.started || l.ended) return;
+      if (!l || l.ended) return;
       const p = l.players.find((x) => x.ws === ws);
       if (!p) return;
       l.players.forEach((o) => { if (o !== p) send(o.ws, { type: 'peer', id: p.id, s: m.s }); });
@@ -175,3 +175,4 @@ wss.on('connection', (ws) => {
 });
 
 wss.on('listening', () => console.log('TrackRace server on ' + PORT));
+    
